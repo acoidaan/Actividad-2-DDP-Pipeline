@@ -53,11 +53,13 @@ reg [31:0] IF_ID_IR;
 reg [9:0]  IF_ID_PC;  // PC+1 de la instruccion (direccion de retorno
                       // para CALL)
 
+// El stall LOAD-use se calcula combinacionalmente mas abajo
+// (load_use_hazard). Cuando se da, IF/ID y PC no avanzan.
 always @(posedge clk or posedge reset) begin
     if (reset) begin
         IF_ID_IR <= 32'b0;
         IF_ID_PC <= 10'b0;
-    end else begin
+    end else if (!load_use_hazard) begin
         IF_ID_IR <= instr;
         IF_ID_PC <= pc_inc;
     end
@@ -96,8 +98,21 @@ uc UC (
     .s_int(id_s_int)
 );
 
-// Banco de registros (lectura combinacional en ID, escritura en WB)
-wire [15:0] rd1, rd2;
+// ============================================================
+// DETECCION DE HAZARD LOAD-USE
+// ============================================================
+// Si la instr en ID/EX es LOAD (MemRead) y su destino coincide con
+// algun fuente de la instr actualmente en ID, hay que pararlo un
+// ciclo (el dato saldra al final de MEM, en MEM/WB.MDR; entonces
+// el forwarding MEM/WB->EX puede resolverlo).
+wire load_use_hazard =
+    ID_EX_MemRead && (ID_EX_wa3 != 4'b0) &&
+    ((ID_EX_wa3 == id_ra1) || (ID_EX_wa3 == id_ra2));
+
+// Banco de registros (lectura combinacional en ID, escritura en WB).
+// 3 puertos de lectura: rd1 (R[ra1]) y rd2 (R[ra2]) para la ALU,
+// rd3 (R[wa3]) para el dato del STORE.
+wire [15:0] rd1, rd2, rd3;
 wire [3:0]  wb_wa3;
 wire [15:0] wb_wd3;
 wire        wb_RegWrite;
@@ -105,15 +120,21 @@ wire        wb_RegWrite;
 regfile RF0 (
     .clk(clk),
     .RegWrite(wb_RegWrite),
-    .ra1(id_ra1), .ra2(id_ra2), .wa3(wb_wa3),
+    .ra1(id_ra1), .ra2(id_ra2), .ra3(id_wa3),
+    .wa3(wb_wa3),
     .wd3(wb_wd3),
-    .rd1(rd1), .rd2(rd2)
+    .rd1(rd1), .rd2(rd2), .rd3(rd3)
 );
+
+// El 3er puerto de lectura (rd3) recibe id_wa3 como direccion. Es
+// el "doble uso" del campo wa3 del IR: destino para LOAD/ALU/LI,
+// fuente para el dato del STORE.
 
 // ============================================================
 // REGISTRO ID/EX
 // ============================================================
 reg [15:0] ID_EX_A, ID_EX_B;
+reg [15:0] ID_EX_StoreData;   // R[wa3] leido en ID, para STORE
 reg [15:0] ID_EX_imm16, ID_EX_desp_ext;
 reg [3:0]  ID_EX_wa3, ID_EX_ra1, ID_EX_ra2;
 reg [5:0]  ID_EX_opcode;
@@ -138,6 +159,7 @@ always @(posedge clk or posedge reset) begin
     if (reset) begin
         ID_EX_A           <= 16'b0;
         ID_EX_B           <= 16'b0;
+        ID_EX_StoreData   <= 16'b0;
         ID_EX_imm16       <= 16'b0;
         ID_EX_desp_ext    <= 16'b0;
         ID_EX_wa3         <= 4'b0;
@@ -159,9 +181,37 @@ always @(posedge clk or posedge reset) begin
         ID_EX_RegWrite    <= 1'b0;
         ID_EX_s_wd3       <= 2'b0;
         ID_EX_s_int       <= 2'b0;
+    end else if (load_use_hazard) begin
+        // Burbuja: ID/EX se llena con NOP (todos los control a 0)
+        // para que en EX/MEM/WB no haya efecto arquitectonico.
+        ID_EX_A           <= 16'b0;
+        ID_EX_B           <= 16'b0;
+        ID_EX_StoreData   <= 16'b0;
+        ID_EX_imm16       <= 16'b0;
+        ID_EX_desp_ext    <= 16'b0;
+        ID_EX_wa3         <= 4'b0;
+        ID_EX_ra1         <= 4'b0;
+        ID_EX_ra2         <= 4'b0;
+        ID_EX_opcode      <= 6'b001111;
+        ID_EX_PC          <= 10'b0;
+        ID_EX_jump_addr   <= 10'b0;
+        ID_EX_op_alu      <= 3'b0;
+        ID_EX_s_alu_imm   <= 2'b0;
+        ID_EX_wez         <= 1'b0;
+        ID_EX_Branch      <= 1'b0;
+        ID_EX_BranchType  <= 2'b0;
+        ID_EX_Call        <= 1'b0;
+        ID_EX_Ret         <= 1'b0;
+        ID_EX_Reti        <= 1'b0;
+        ID_EX_MemRead     <= 1'b0;
+        ID_EX_MemWrite    <= 1'b0;
+        ID_EX_RegWrite    <= 1'b0;
+        ID_EX_s_wd3       <= 2'b0;
+        ID_EX_s_int       <= 2'b0;
     end else begin
         ID_EX_A           <= rd1;
         ID_EX_B           <= rd2;
+        ID_EX_StoreData   <= rd3;
         ID_EX_imm16       <= id_imm16;
         ID_EX_desp_ext    <= id_desp_ext;
         ID_EX_wa3         <= id_wa3;
@@ -205,6 +255,14 @@ wire [1:0] forwardB =
     (MEM_WB_RegWrite && (MEM_WB_wa3 != 4'b0) && (MEM_WB_wa3 == ID_EX_ra2))                    ? 2'b01 :
     2'b00;
 
+// Forwarding del dato del STORE (que se lee de R[wa3] en ID).
+// Compara ID_EX_wa3 (que para STORE es la *fuente*) con los wa3 de
+// las instrucciones anteriores que estan escribiendo.
+wire [1:0] forwardStore =
+    (EX_MEM_RegWrite && (EX_MEM_wa3 != 4'b0) && (EX_MEM_wa3 == ID_EX_wa3) && !EX_MEM_MemRead) ? 2'b10 :
+    (MEM_WB_RegWrite && (MEM_WB_wa3 != 4'b0) && (MEM_WB_wa3 == ID_EX_wa3))                    ? 2'b01 :
+    2'b00;
+
 // Operandos A y B con forwarding aplicado
 wire [15:0] ex_A_fwd =
     (forwardA == 2'b10) ? EX_MEM_WBData :
@@ -215,6 +273,13 @@ wire [15:0] ex_B_fwd =
     (forwardB == 2'b10) ? EX_MEM_WBData :
     (forwardB == 2'b01) ? wb_wd3        :
     ID_EX_B;
+
+// Store data con forwarding aplicado (dato a escribir en memoria
+// en MEM cuando la instr es STORE).
+wire [15:0] ex_StoreData_fwd =
+    (forwardStore == 2'b10) ? EX_MEM_WBData :
+    (forwardStore == 2'b01) ? wb_wd3        :
+    ID_EX_StoreData;
 
 // Mux que selecciona la entrada B del ALU (B o imm16 o desp_ext)
 wire [15:0] ex_alu_b;
@@ -285,8 +350,13 @@ wire [9:0] ex_jump_target =
 // Actualizacion de PC (en IF)
 //   Por defecto: PC <= pc_inc (PC+1).
 //   Si hay salto en EX: PC <= ex_jump_target.
+//   Si stall LOAD-use: pc_next se congela en pc (asi memprog
+//   tampoco avanza la lectura y no se pierde ninguna
+//   instruccion).
 // ============================================================
-assign pc_next = ex_PCChange ? ex_jump_target : pc_inc;
+assign pc_next = load_use_hazard ? pc :
+                 ex_PCChange     ? ex_jump_target :
+                                   pc_inc;
 
 always @(posedge clk or posedge reset) begin
     if (reset) pc <= 10'b0;
@@ -320,7 +390,7 @@ always @(posedge clk or posedge reset) begin
         EX_MEM_s_wd3    <= 2'b0;
     end else begin
         EX_MEM_ALUOut   <= ex_alu_out;
-        EX_MEM_B        <= ex_B_fwd;      // STORE usa B con forwarding
+        EX_MEM_B        <= ex_StoreData_fwd; // dato a STORE (con forwarding)
         EX_MEM_imm16    <= ID_EX_imm16;
         EX_MEM_WBData   <= ex_wb_data;
         EX_MEM_wa3      <= ID_EX_wa3;

@@ -1,16 +1,20 @@
 //Componentes varios
 
 // Banco de registros para el pipeline.
-// Lectura combinacional en ID, escritura sincrona en WB.
-// Ya no necesita conducir el bus de datos para STORE: en pipeline el
-// dato del STORE viaja por los stage registers ID/EX_B -> EX/MEM_B y
-// el cd lo conduce al bus en MEM.
+// Tres puertos de lectura combinacionales:
+//   rd1 = R[ra1]   - operando A de la ALU
+//   rd2 = R[ra2]   - operando B de la ALU
+//   rd3 = R[ra3]   - dato a almacenar en STORE (la UC conecta ra3
+//                    al campo wa3 del IR de la instruccion en ID).
+// Un puerto de escritura sincrona en WB:
+//   wd3 -> R[wa3] si RegWrite.
 module regfile #(parameter INIT_FILE = "C:\\Users\\acoid\\Documents\\Actividad-2-DDP-Multiciclo\\src\\regfile.dat")
               (input  wire        clk,
                input  wire        RegWrite,
-               input  wire [3:0]  ra1, ra2, wa3,
+               input  wire [3:0]  ra1, ra2, ra3,  // direcciones de lectura
+               input  wire [3:0]  wa3,            // direccion de escritura
                input  wire [15:0] wd3,
-               output wire [15:0] rd1, rd2);
+               output wire [15:0] rd1, rd2, rd3);
 
   reg [15:0] regb[0:15];
 
@@ -21,9 +25,21 @@ module regfile #(parameter INIT_FILE = "C:\\Users\\acoid\\Documents\\Actividad-2
   always @(posedge clk)
     if (RegWrite && (wa3 != 4'b0000)) regb[wa3] <= wd3;
 
-  // Registro 0 siempre devuelve 0
-  assign rd1 = (ra1 != 0) ? regb[ra1] : 16'b0;
-  assign rd2 = (ra2 != 0) ? regb[ra2] : 16'b0;
+  // Write-before-read interno: si WB esta escribiendo el mismo
+  // registro que ID esta leyendo, el puerto de lectura devuelve
+  // directamente wd3 sin esperar al siguiente ciclo. Esto evita
+  // un ciclo de penalizacion extra en cadenas LOAD->use->use.
+  wire wb_active = RegWrite && (wa3 != 4'b0000);
+
+  assign rd1 = (ra1 == 0)                      ? 16'b0  :
+               (wb_active && (wa3 == ra1))     ? wd3    :
+                                                 regb[ra1];
+  assign rd2 = (ra2 == 0)                      ? 16'b0  :
+               (wb_active && (wa3 == ra2))     ? wd3    :
+                                                 regb[ra2];
+  assign rd3 = (ra3 == 0)                      ? 16'b0  :
+               (wb_active && (wa3 == ra3))     ? wd3    :
+                                                 regb[ra3];
 
 endmodule
 

@@ -1,0 +1,22 @@
+# Quartus
+db/
+incremental_db/
+output_files/
+
+# Icarus Verilog
+*.sim
+asm
+ensamblador
+src/greybox_tmp/
+
+# ModelSim
+simulation/
+transcript
+vsim.wlf
+*.vcd
+*.wlf
+*.rpt
+
+# Windows
+*.log
+*.bak

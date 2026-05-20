@@ -55,9 +55,15 @@ reg [9:0]  IF_ID_PC;  // PC+1 de la instruccion (direccion de retorno
 
 // El stall LOAD-use se calcula combinacionalmente mas abajo
 // (load_use_hazard). Cuando se da, IF/ID y PC no avanzan.
+// Cuando hay flush (salto tomado en EX), IF/ID se llena con NOP
+// para anular la instruccion fantasma que ya estaba en IF.
 always @(posedge clk or posedge reset) begin
     if (reset) begin
         IF_ID_IR <= 32'b0;
+        IF_ID_PC <= 10'b0;
+    end else if (flush) begin
+        // Anular la instruccion en IF (que se cargaria en IF/ID)
+        IF_ID_IR <= 32'h3C000000;   // NOP (opcode 001111, resto 0)
         IF_ID_PC <= 10'b0;
     end else if (!load_use_hazard) begin
         IF_ID_IR <= instr;
@@ -181,9 +187,14 @@ always @(posedge clk or posedge reset) begin
         ID_EX_RegWrite    <= 1'b0;
         ID_EX_s_wd3       <= 2'b0;
         ID_EX_s_int       <= 2'b0;
-    end else if (load_use_hazard) begin
+    end else if (load_use_hazard || flush) begin
         // Burbuja: ID/EX se llena con NOP (todos los control a 0)
         // para que en EX/MEM/WB no haya efecto arquitectonico.
+        // Esto cubre dos casos:
+        //   - load_use_hazard: stall, congelamos ID y metemos
+        //     bubble en EX.
+        //   - flush: salto tomado, anulamos la instruccion en ID
+        //     que es "fantasma".
         ID_EX_A           <= 16'b0;
         ID_EX_B           <= 16'b0;
         ID_EX_StoreData   <= 16'b0;
@@ -326,6 +337,12 @@ wire ex_BranchTaken =
 
 // Saltos que cambian PC: J/JZ tomado/JNZ tomado/CALL/RET/RETI
 wire ex_PCChange = ex_BranchTaken || ID_EX_Call || ID_EX_Ret || ID_EX_Reti;
+
+// Flush: cuando se toma un salto en EX, las 2 instrucciones que
+// ya estan en IF e ID son "fantasma" (entraron en el pipeline
+// antes de saber que el PC iba a cambiar). Hay que anularlas
+// inyectando NOPs en sus stage registers en el siguiente posedge.
+wire flush = ex_PCChange;
 
 // ============================================================
 // PILA (manejo de CALL / RET / RETI)

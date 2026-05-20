@@ -13,13 +13,10 @@ module DE1_System(
     wire [15:0] bus_direccion, bus_data;
     wire [1:0]  bus_control;
     wire        irq_ack, irq_line;
-    wire clock_pll;
-
-    pll_multi PLL0(.inclk0(CLOCK_50), .c0(clock_pll));
 
     // CPU
     cpu_ampliada CPU(
-        .clk(clock_pll), .reset(reset), .irq_in(irq_line),
+        .clk(CLOCK_50), .reset(reset), .irq_in(irq_line),
         .pc_out(pc), .bus_direccion(bus_direccion),
         .bus_data(bus_data), .bus_control(bus_control),
         .irq_ack(irq_ack)
@@ -33,7 +30,7 @@ module DE1_System(
                          cs_timer_top, cs_timer_cnt);
 
     // Memoria de datos
-    memdata MEMD(.clk(clock_pll), .cs(cs_mem), .ctrl(bus_control),
+    memdata MEMD(.clk(CLOCK_50), .cs(cs_mem), .ctrl(bus_control),
                  .addr(bus_direccion[9:0]), .data_bus(bus_data));
 
     // Periféricos entrada
@@ -44,12 +41,12 @@ module DE1_System(
     wire [9:0] ledr_reg; wire [7:0] ledg_reg;
     wire [15:0] hex01_reg, hex23_reg;
 
-    //periferico_out #(10) P_LEDR (.clk(clock_pll), .reset(reset), .cs(cs_ledr), .ctrl(bus_control), .data_bus(bus_data), .valor_out(ledr_reg));
-    periferico_out #(8)  P_LEDG (.clk(clock_pll), .reset(reset), .cs(cs_ledg),
+    //periferico_out #(10) P_LEDR (.clk(CLOCK_50), .reset(reset), .cs(cs_ledr), .ctrl(bus_control), .data_bus(bus_data), .valor_out(ledr_reg));
+    periferico_out #(8)  P_LEDG (.clk(CLOCK_50), .reset(reset), .cs(cs_ledg),
         .ctrl(bus_control), .data_bus(bus_data), .valor_out(ledg_reg));
-    periferico_out #(16) P_HEX01(.clk(clock_pll), .reset(reset), .cs(cs_hex01),
+    periferico_out #(16) P_HEX01(.clk(CLOCK_50), .reset(reset), .cs(cs_hex01),
         .ctrl(bus_control), .data_bus(bus_data), .valor_out(hex01_reg));
-    periferico_out #(16) P_HEX23(.clk(clock_pll), .reset(reset), .cs(cs_hex23),
+    periferico_out #(16) P_HEX23(.clk(CLOCK_50), .reset(reset), .cs(cs_hex23),
         .ctrl(bus_control), .data_bus(bus_data), .valor_out(hex23_reg));
 
     assign LEDR = pc;
@@ -59,7 +56,7 @@ module DE1_System(
 
     // Timer con interrupción
     timer TIMER0(
-        .clk(clock_pll), .reset(reset),
+        .clk(CLOCK_50), .reset(reset),
         .cs_top(cs_timer_top), .cs_cnt(cs_timer_cnt),
         .ctrl(bus_control), .irq_ack(irq_ack),
         .data_bus(bus_data), .irq_out(irq_line)

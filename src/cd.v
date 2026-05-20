@@ -187,22 +187,58 @@ always @(posedge clk or posedge reset) begin
 end
 
 // ============================================================
-// ETAPA EX: ALU + decision de salto
+// ETAPA EX: forwarding + ALU + decision de salto
 // ============================================================
+
+// --- Logica de forwarding (FASE 2) ---
+// Prioridad: EX/MEM (mas reciente) > MEM/WB > stage register.
+// NOTA: para LOAD (EX_MEM_MemRead=1) el dato aun no esta en
+// EX_MEM_WBData (solo la direccion en ALUOut). Por eso este
+// forwarding NO cubre LOAD-use, que se trata con stall en Fase 3.
+wire [1:0] forwardA =
+    (EX_MEM_RegWrite && (EX_MEM_wa3 != 4'b0) && (EX_MEM_wa3 == ID_EX_ra1) && !EX_MEM_MemRead) ? 2'b10 :
+    (MEM_WB_RegWrite && (MEM_WB_wa3 != 4'b0) && (MEM_WB_wa3 == ID_EX_ra1))                    ? 2'b01 :
+    2'b00;
+
+wire [1:0] forwardB =
+    (EX_MEM_RegWrite && (EX_MEM_wa3 != 4'b0) && (EX_MEM_wa3 == ID_EX_ra2) && !EX_MEM_MemRead) ? 2'b10 :
+    (MEM_WB_RegWrite && (MEM_WB_wa3 != 4'b0) && (MEM_WB_wa3 == ID_EX_ra2))                    ? 2'b01 :
+    2'b00;
+
+// Operandos A y B con forwarding aplicado
+wire [15:0] ex_A_fwd =
+    (forwardA == 2'b10) ? EX_MEM_WBData :
+    (forwardA == 2'b01) ? wb_wd3        :
+    ID_EX_A;
+
+wire [15:0] ex_B_fwd =
+    (forwardB == 2'b10) ? EX_MEM_WBData :
+    (forwardB == 2'b01) ? wb_wd3        :
+    ID_EX_B;
+
+// Mux que selecciona la entrada B del ALU (B o imm16 o desp_ext)
 wire [15:0] ex_alu_b;
 wire [15:0] ex_alu_out;
 wire        ex_zero;
 
 mux4 #(16) MUX_ALU_B (
-    ID_EX_B, ID_EX_imm16, ID_EX_desp_ext, 16'b0,
+    ex_B_fwd, ID_EX_imm16, ID_EX_desp_ext, 16'b0,
     ID_EX_s_alu_imm,
     ex_alu_b
 );
 
 alu ALU0 (
-    ID_EX_A, ex_alu_b, ID_EX_op_alu,
+    ex_A_fwd, ex_alu_b, ID_EX_op_alu,
     ex_alu_out, ex_zero
 );
+
+// Valor que esta instruccion escribira en RF (combinacional en EX):
+//   * ALU/LOAD direccion: ex_alu_out
+//   * LI:                 ID_EX_imm16
+// Se latchea en EX_MEM_WBData para que las instrucciones
+// posteriores puedan forwardear desde aqui.
+wire [15:0] ex_wb_data =
+    (ID_EX_s_wd3 == 2'b11) ? ID_EX_imm16 : ex_alu_out;
 
 // Flag Z: ahora se escribe directamente desde EX (wez de la instr
 // que acaba de ejecutar en la ALU). En las fases siguientes habra
@@ -261,8 +297,9 @@ end
 // REGISTRO EX/MEM
 // ============================================================
 reg [15:0] EX_MEM_ALUOut;
-reg [15:0] EX_MEM_B;          // para STORE
+reg [15:0] EX_MEM_B;          // dato a STORE (ya con forwarding)
 reg [15:0] EX_MEM_imm16;      // para LI write-back
+reg [15:0] EX_MEM_WBData;     // dato que escribira RF (para forwarding)
 reg [3:0]  EX_MEM_wa3;
 reg [5:0]  EX_MEM_opcode;
 reg        EX_MEM_MemRead, EX_MEM_MemWrite;
@@ -274,6 +311,7 @@ always @(posedge clk or posedge reset) begin
         EX_MEM_ALUOut   <= 16'b0;
         EX_MEM_B        <= 16'b0;
         EX_MEM_imm16    <= 16'b0;
+        EX_MEM_WBData   <= 16'b0;
         EX_MEM_wa3      <= 4'b0;
         EX_MEM_opcode   <= 6'b001111;
         EX_MEM_MemRead  <= 1'b0;
@@ -282,8 +320,9 @@ always @(posedge clk or posedge reset) begin
         EX_MEM_s_wd3    <= 2'b0;
     end else begin
         EX_MEM_ALUOut   <= ex_alu_out;
-        EX_MEM_B        <= ID_EX_B;
+        EX_MEM_B        <= ex_B_fwd;      // STORE usa B con forwarding
         EX_MEM_imm16    <= ID_EX_imm16;
+        EX_MEM_WBData   <= ex_wb_data;
         EX_MEM_wa3      <= ID_EX_wa3;
         EX_MEM_opcode   <= ID_EX_opcode;
         EX_MEM_MemRead  <= ID_EX_MemRead;

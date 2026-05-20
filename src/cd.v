@@ -1,165 +1,358 @@
 // ============================================================
-// Camino de datos multiciclo
+// Camino de datos PIPELINE de 5 etapas
 //
-// Anade registros intermedios sobre la base single-cycle:
-//   IR      (32b) : instruccion latcheada al final de IF
-//   A, B    (16b) : RF[ra1], RF[ra2] latcheados al final de ID
-//   ALUOut  (16b) : resultado de la ALU latcheado al final de EX
-//   MDR     (16b) : dato leido del bus latcheado al final de MEM
+//   IF -> IF/ID -> ID -> ID/EX -> EX -> EX/MEM -> MEM -> MEM/WB -> WB
 //
-// memprog sigue siendo asincrono en fase 1a (se pasara a BRAM
-// sincrona en fase 1b).
+// Cada etapa avanza en cada flanco de reloj (sin stalls en Fase 1).
+// La UC es combinacional sobre el opcode de IF/ID y produce las
+// senales de control que viajan por los stage registers hasta su
+// etapa de consumo.
+//
+// FASE 1: NO hay forwarding, NO hay stalls, NO hay flush. Solo el
+// datapath limpio. Los programas de test deben separar instrucciones
+// con dependencias por al menos 3 NOPs para evitar hazards RAW.
 // ============================================================
 
 module cd(
     input  wire        clk, reset,
 
-    // Senales de la UC
-    input  wire        PCWrite,
-    input  wire [1:0]  PCSrc,
-    input  wire        IRWrite,
-    input  wire [1:0]  s_we3,
-    input  wire [1:0]  s_wd3,
-    input  wire [1:0]  s_alu_imm,
-    input  wire [2:0]  op_alu,
-    input  wire        wez,
-    input  wire        ALUOutWrite,
-    input  wire        MDRWrite,
-    input  wire        IorD,
-    input  wire [1:0]  s_bat,
-    input  wire [1:0]  s_int,
-    input  wire        s_irq,
-
-    // Estado arquitectonico expuesto a la UC
-    output wire        z, ie_out,
-    output wire [5:0]  opcode,
-
     // Salidas a top-level
     output wire [9:0]  pc_out,
     input  wire [15:0] bus_data_in,
     output wire [15:0] bus_data_out,
-    output wire [15:0] bus_direccion
+    output wire [15:0] bus_direccion,
+    output wire [1:0]  bus_control,
+
+    // Interrupciones
+    input  wire        irq_in,
+    output wire        irq_ack
 );
 
 // ============================================================
-// PC
+// ETAPA IF: fetch de instruccion
 // ============================================================
-wire [9:0] pc;
-wire [9:0] pc_inc;
-wire [9:0] jump_addr;
-wire [9:0] stack_top;
-wire [9:0] pc_next;
-
-sum SUM1 (pc, 10'd1, pc_inc);
-
-// PC con habilitacion (PCWrite, solo asertado en S_WB)
-registro_en #(10) PCREG (clk, reset, PCWrite, pc_next, pc);
-
-// MUX_PC: 00=PC+1, 01=jump_addr, 10=stack_top, 11=0
-mux4 #(10) MUX_PC (pc_inc, jump_addr, stack_top, 10'b0, PCSrc, pc_next);
-
-// ============================================================
-// Memoria de programa (lectura sincrona, latencia 1)
-//
-// Durante S_WB drive addr=pc_next (prefetch del siguiente fetch).
-// Resto de estados: addr=pc (estable). Esto se logra usando
-// PCWrite como selector ya que PCWrite=1 solo en S_WB.
-// ============================================================
-wire [9:0]  mp_addr = PCWrite ? pc_next : pc;
+reg  [9:0]  pc;
+wire [9:0]  pc_inc;
+wire [9:0]  pc_next;
 wire [31:0] instr;
-memprog MP (clk, mp_addr, instr);
+
+sum SUM_PC (pc, 10'd1, pc_inc);
+
+// memprog: lectura sincrona (M4K). Direccion = pc_next para que en
+// el flanco siguiente IR ya tenga la instruccion correcta.
+memprog MP (clk, pc_next, instr);
+
+// PC: por defecto incrementa, pero los saltos lo sobreescriben.
+// Detallaremos pc_next mas abajo despues de instanciar la unidad de
+// resolucion de saltos en EX.
 
 // ============================================================
-// IR
+// REGISTRO IF/ID
 // ============================================================
-reg [31:0] IR;
-always @(posedge clk or posedge reset) begin
-    if (reset)        IR <= 32'b0;
-    else if (IRWrite) IR <= instr;
-end
+reg [31:0] IF_ID_IR;
+reg [9:0]  IF_ID_PC;  // PC+1 de la instruccion (direccion de retorno
+                      // para CALL)
 
-assign opcode = IR[31:26];
-wire [3:0]  wa3        = IR[25:22];
-wire [3:0]  ra1        = IR[21:18];
-wire [3:0]  ra2        = IR[17:14];
-wire [15:0] imm16      = IR[17:2];
-wire [15:0] desp_ext   = {6'b0, IR[11:2]};
-wire [9:0]  instr_addr = IR[9:0];
-
-// ============================================================
-// Pila + IRQ (no usados en fase 1a, pero el cableado se mantiene)
-// ============================================================
-// Vector de IRQ
-mux2 #(10) MUX_VECTOR (instr_addr, 10'h010, s_irq, jump_addr);
-
-// En este multiciclo el PC se actualiza solo en S_WB. Durante S_WB
-// pc aun vale la direccion de la instruccion actual; el siguiente
-// PC (pc_inc) es la direccion de retorno para CALL. Para IRQ se
-// pushea pc (la instruccion interrumpida).
-wire [9:0] stack_din;
-mux2 #(10) MUX_STACK_DIN (pc_inc, pc, s_irq, stack_din);
-stack PILA (clk, reset, s_bat, stack_din, stack_top);
-
-// ============================================================
-// Banco de registros + registros A, B
-// ============================================================
-wire [15:0] rd1, rd2, wd3;
-regfile RF0 (clk, s_we3, ra1, ra2, wa3, wd3, rd1, rd2, bus_data_out);
-
-reg [15:0] A, B;
 always @(posedge clk or posedge reset) begin
     if (reset) begin
-        A <= 16'b0;
-        B <= 16'b0;
+        IF_ID_IR <= 32'b0;
+        IF_ID_PC <= 10'b0;
     end else begin
-        // Carga incondicional cada ciclo. En S_ID quedan latcheados
-        // los valores correctos para usar en S_EX/S_MEM.
-        A <= rd1;
-        B <= rd2;
+        IF_ID_IR <= instr;
+        IF_ID_PC <= pc_inc;
     end
 end
 
 // ============================================================
-// ALU + ALUOut
+// ETAPA ID: decode + lectura de registros
 // ============================================================
-wire [15:0] alu_b, alu_out;
-wire zero_comb;
+wire [5:0]  id_opcode    = IF_ID_IR[31:26];
+wire [3:0]  id_wa3       = IF_ID_IR[25:22];
+wire [3:0]  id_ra1       = IF_ID_IR[21:18];
+wire [3:0]  id_ra2       = IF_ID_IR[17:14];
+wire [15:0] id_imm16     = IF_ID_IR[17:2];
+wire [15:0] id_desp_ext  = {6'b0, IF_ID_IR[11:2]};
+wire [9:0]  id_jump_addr = IF_ID_IR[9:0];
 
-mux4 #(16) MUX_ALU_B (B, imm16, desp_ext, 16'b0, s_alu_imm, alu_b);
-alu ALU0 (A, alu_b, op_alu, alu_out, zero_comb);
+// Decodificacion combinacional
+wire [1:0]  id_s_alu_imm;
+wire [2:0]  id_op_alu;
+wire        id_wez;
+wire        id_Branch;
+wire [1:0]  id_BranchType;
+wire        id_Call, id_Ret, id_Reti;
+wire        id_MemRead, id_MemWrite;
+wire        id_RegWrite;
+wire [1:0]  id_s_wd3;
+wire [1:0]  id_s_int;
 
-reg [15:0] ALUOut;
+uc UC (
+    .opcode(id_opcode),
+    .s_alu_imm(id_s_alu_imm), .op_alu(id_op_alu), .wez(id_wez),
+    .Branch(id_Branch), .BranchType(id_BranchType),
+    .Call(id_Call), .Ret(id_Ret), .Reti(id_Reti),
+    .MemRead(id_MemRead), .MemWrite(id_MemWrite),
+    .RegWrite(id_RegWrite), .s_wd3(id_s_wd3),
+    .s_int(id_s_int)
+);
+
+// Banco de registros (lectura combinacional en ID, escritura en WB)
+wire [15:0] rd1, rd2;
+wire [3:0]  wb_wa3;
+wire [15:0] wb_wd3;
+wire        wb_RegWrite;
+
+regfile RF0 (
+    .clk(clk),
+    .RegWrite(wb_RegWrite),
+    .ra1(id_ra1), .ra2(id_ra2), .wa3(wb_wa3),
+    .wd3(wb_wd3),
+    .rd1(rd1), .rd2(rd2)
+);
+
+// ============================================================
+// REGISTRO ID/EX
+// ============================================================
+reg [15:0] ID_EX_A, ID_EX_B;
+reg [15:0] ID_EX_imm16, ID_EX_desp_ext;
+reg [3:0]  ID_EX_wa3, ID_EX_ra1, ID_EX_ra2;
+reg [5:0]  ID_EX_opcode;
+reg [9:0]  ID_EX_PC;
+reg [9:0]  ID_EX_jump_addr;
+// Control EX
+reg [2:0]  ID_EX_op_alu;
+reg [1:0]  ID_EX_s_alu_imm;
+reg        ID_EX_wez;
+reg        ID_EX_Branch;
+reg [1:0]  ID_EX_BranchType;
+reg        ID_EX_Call, ID_EX_Ret, ID_EX_Reti;
+// Control MEM
+reg        ID_EX_MemRead, ID_EX_MemWrite;
+// Control WB
+reg        ID_EX_RegWrite;
+reg [1:0]  ID_EX_s_wd3;
+// Interrupciones
+reg [1:0]  ID_EX_s_int;
+
 always @(posedge clk or posedge reset) begin
-    if (reset)            ALUOut <= 16'b0;
-    else if (ALUOutWrite) ALUOut <= alu_out;
+    if (reset) begin
+        ID_EX_A           <= 16'b0;
+        ID_EX_B           <= 16'b0;
+        ID_EX_imm16       <= 16'b0;
+        ID_EX_desp_ext    <= 16'b0;
+        ID_EX_wa3         <= 4'b0;
+        ID_EX_ra1         <= 4'b0;
+        ID_EX_ra2         <= 4'b0;
+        ID_EX_opcode      <= 6'b001111;   // NOP
+        ID_EX_PC          <= 10'b0;
+        ID_EX_jump_addr   <= 10'b0;
+        ID_EX_op_alu      <= 3'b0;
+        ID_EX_s_alu_imm   <= 2'b0;
+        ID_EX_wez         <= 1'b0;
+        ID_EX_Branch      <= 1'b0;
+        ID_EX_BranchType  <= 2'b0;
+        ID_EX_Call        <= 1'b0;
+        ID_EX_Ret         <= 1'b0;
+        ID_EX_Reti        <= 1'b0;
+        ID_EX_MemRead     <= 1'b0;
+        ID_EX_MemWrite    <= 1'b0;
+        ID_EX_RegWrite    <= 1'b0;
+        ID_EX_s_wd3       <= 2'b0;
+        ID_EX_s_int       <= 2'b0;
+    end else begin
+        ID_EX_A           <= rd1;
+        ID_EX_B           <= rd2;
+        ID_EX_imm16       <= id_imm16;
+        ID_EX_desp_ext    <= id_desp_ext;
+        ID_EX_wa3         <= id_wa3;
+        ID_EX_ra1         <= id_ra1;
+        ID_EX_ra2         <= id_ra2;
+        ID_EX_opcode      <= id_opcode;
+        ID_EX_PC          <= IF_ID_PC;
+        ID_EX_jump_addr   <= id_jump_addr;
+        ID_EX_op_alu      <= id_op_alu;
+        ID_EX_s_alu_imm   <= id_s_alu_imm;
+        ID_EX_wez         <= id_wez;
+        ID_EX_Branch      <= id_Branch;
+        ID_EX_BranchType  <= id_BranchType;
+        ID_EX_Call        <= id_Call;
+        ID_EX_Ret         <= id_Ret;
+        ID_EX_Reti        <= id_Reti;
+        ID_EX_MemRead     <= id_MemRead;
+        ID_EX_MemWrite    <= id_MemWrite;
+        ID_EX_RegWrite    <= id_RegWrite;
+        ID_EX_s_wd3       <= id_s_wd3;
+        ID_EX_s_int       <= id_s_int;
+    end
 end
 
 // ============================================================
-// Direccion al bus externo y MDR
+// ETAPA EX: ALU + decision de salto
 // ============================================================
-// IorD=0: el bus no se usa (IF). IorD=1: direccion = ALUOut (MEM).
-// Se deja ALUOut siempre cableado; el control del bus se hace via
-// bus_control desde la UC (00 = idle).
-assign bus_direccion = ALUOut;
+wire [15:0] ex_alu_b;
+wire [15:0] ex_alu_out;
+wire        ex_zero;
 
-reg [15:0] MDR;
+mux4 #(16) MUX_ALU_B (
+    ID_EX_B, ID_EX_imm16, ID_EX_desp_ext, 16'b0,
+    ID_EX_s_alu_imm,
+    ex_alu_b
+);
+
+alu ALU0 (
+    ID_EX_A, ex_alu_b, ID_EX_op_alu,
+    ex_alu_out, ex_zero
+);
+
+// Flag Z: ahora se escribe directamente desde EX (wez de la instr
+// que acaba de ejecutar en la ALU). En las fases siguientes habra
+// que tener cuidado con que las dependencias entre flag-setter y
+// flag-reader se resuelvan en orden correcto.
+wire flag_z;
+ffd FZ (clk, reset, ex_zero, ID_EX_wez, flag_z);
+
+// Decision de salto (combinacional en EX)
+//   Branch + BranchType:
+//     00 -> J   siempre tomado
+//     01 -> JZ  tomado si flag_z=1
+//     10 -> JNZ tomado si flag_z=0
+wire ex_BranchTaken =
+    ID_EX_Branch && (
+        (ID_EX_BranchType == 2'b00) ||
+        (ID_EX_BranchType == 2'b01 && flag_z) ||
+        (ID_EX_BranchType == 2'b10 && !flag_z)
+    );
+
+// Saltos que cambian PC: J/JZ tomado/JNZ tomado/CALL/RET/RETI
+wire ex_PCChange = ex_BranchTaken || ID_EX_Call || ID_EX_Ret || ID_EX_Reti;
+
+// ============================================================
+// PILA (manejo de CALL / RET / RETI)
+// ============================================================
+// PUSH cuando hay CALL en EX (push PC+1 de la instruccion CALL, que
+// era IF_ID_PC en su momento, ahora esta en ID_EX_PC).
+// POP cuando hay RET o RETI en EX.
+wire [1:0]  s_bat;
+assign s_bat = ID_EX_Call ? 2'b01 :
+               (ID_EX_Ret || ID_EX_Reti) ? 2'b10 :
+               2'b00;
+wire [9:0] stack_top;
+stack PILA (clk, reset, s_bat, ID_EX_PC, stack_top);
+
+// ============================================================
+// Direccion de salto: jump_addr de instr o stack_top para RET
+// ============================================================
+wire [9:0] ex_jump_target =
+    (ID_EX_Ret || ID_EX_Reti) ? stack_top : ID_EX_jump_addr;
+
+// ============================================================
+// Actualizacion de PC (en IF)
+//   Por defecto: PC <= pc_inc (PC+1).
+//   Si hay salto en EX: PC <= ex_jump_target.
+// ============================================================
+assign pc_next = ex_PCChange ? ex_jump_target : pc_inc;
+
 always @(posedge clk or posedge reset) begin
-    if (reset)         MDR <= 16'b0;
-    else if (MDRWrite) MDR <= bus_data_in;
+    if (reset) pc <= 10'b0;
+    else       pc <= pc_next;
 end
 
 // ============================================================
-// MUX write-back: 00=ALUOut, 01=MDR (LOAD), 10=0, 11=imm16 (LI)
+// REGISTRO EX/MEM
 // ============================================================
-mux4 #(16) MUX_WD3 (ALUOut, MDR, 16'b0, imm16, s_wd3, wd3);
+reg [15:0] EX_MEM_ALUOut;
+reg [15:0] EX_MEM_B;          // para STORE
+reg [15:0] EX_MEM_imm16;      // para LI write-back
+reg [3:0]  EX_MEM_wa3;
+reg [5:0]  EX_MEM_opcode;
+reg        EX_MEM_MemRead, EX_MEM_MemWrite;
+reg        EX_MEM_RegWrite;
+reg [1:0]  EX_MEM_s_wd3;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        EX_MEM_ALUOut   <= 16'b0;
+        EX_MEM_B        <= 16'b0;
+        EX_MEM_imm16    <= 16'b0;
+        EX_MEM_wa3      <= 4'b0;
+        EX_MEM_opcode   <= 6'b001111;
+        EX_MEM_MemRead  <= 1'b0;
+        EX_MEM_MemWrite <= 1'b0;
+        EX_MEM_RegWrite <= 1'b0;
+        EX_MEM_s_wd3    <= 2'b0;
+    end else begin
+        EX_MEM_ALUOut   <= ex_alu_out;
+        EX_MEM_B        <= ID_EX_B;
+        EX_MEM_imm16    <= ID_EX_imm16;
+        EX_MEM_wa3      <= ID_EX_wa3;
+        EX_MEM_opcode   <= ID_EX_opcode;
+        EX_MEM_MemRead  <= ID_EX_MemRead;
+        EX_MEM_MemWrite <= ID_EX_MemWrite;
+        EX_MEM_RegWrite <= ID_EX_RegWrite;
+        EX_MEM_s_wd3    <= ID_EX_s_wd3;
+    end
+end
 
 // ============================================================
-// Flags
+// ETAPA MEM: acceso a memoria de datos / perifericos
 // ============================================================
-ffd FZ (clk, reset, zero_comb, wez, z);
+assign bus_direccion = EX_MEM_ALUOut;
+assign bus_control   = EX_MEM_MemRead  ? 2'b01 :
+                       EX_MEM_MemWrite ? 2'b10 :
+                       2'b00;
+// El bus de datos se conduce con EX_MEM_B en STORE (lo gestiona
+// cpu_ampliada via la senal mem_drive_bus)
+assign bus_data_out  = EX_MEM_B;
 
-wire ie_load = s_int[0] | s_int[1];
-ffd FIE (clk, reset, s_int[0], ie_load, ie_out);
+// ============================================================
+// REGISTRO MEM/WB
+// ============================================================
+reg [15:0] MEM_WB_ALUOut;
+reg [15:0] MEM_WB_MDR;
+reg [15:0] MEM_WB_imm16;
+reg [3:0]  MEM_WB_wa3;
+reg        MEM_WB_RegWrite;
+reg [1:0]  MEM_WB_s_wd3;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        MEM_WB_ALUOut   <= 16'b0;
+        MEM_WB_MDR      <= 16'b0;
+        MEM_WB_imm16    <= 16'b0;
+        MEM_WB_wa3      <= 4'b0;
+        MEM_WB_RegWrite <= 1'b0;
+        MEM_WB_s_wd3    <= 2'b0;
+    end else begin
+        MEM_WB_ALUOut   <= EX_MEM_ALUOut;
+        MEM_WB_MDR      <= bus_data_in;
+        MEM_WB_imm16    <= EX_MEM_imm16;
+        MEM_WB_wa3      <= EX_MEM_wa3;
+        MEM_WB_RegWrite <= EX_MEM_RegWrite;
+        MEM_WB_s_wd3    <= EX_MEM_s_wd3;
+    end
+end
+
+// ============================================================
+// ETAPA WB: write-back al banco de registros
+// ============================================================
+mux4 #(16) MUX_WD3 (
+    MEM_WB_ALUOut, MEM_WB_MDR, 16'b0, MEM_WB_imm16,
+    MEM_WB_s_wd3,
+    wb_wd3
+);
+
+assign wb_wa3      = MEM_WB_wa3;
+assign wb_RegWrite = MEM_WB_RegWrite;
+
+// ============================================================
+// Flag IE (placeholder - interrupciones en fase 5)
+// ============================================================
+wire ie_load;
+assign ie_load = ID_EX_s_int[0] | ID_EX_s_int[1];
+wire ie_out;
+ffd FIE (clk, reset, ID_EX_s_int[0], ie_load, ie_out);
+
+assign irq_ack = 1'b0;     // todavia no implementado
 
 // ============================================================
 // Salidas

@@ -55,13 +55,13 @@ reg [9:0]  IF_ID_PC;  // PC+1 de la instruccion (direccion de retorno
 
 // El stall LOAD-use se calcula combinacionalmente mas abajo
 // (load_use_hazard). Cuando se da, IF/ID y PC no avanzan.
-// Cuando hay flush (salto tomado en EX), IF/ID se llena con NOP
-// para anular la instruccion fantasma que ya estaba en IF.
+// Cuando hay flush (salto tomado en EX) o IRQ, IF/ID se llena
+// con NOP para anular la instruccion fantasma.
 always @(posedge clk or posedge reset) begin
     if (reset) begin
         IF_ID_IR <= 32'b0;
         IF_ID_PC <= 10'b0;
-    end else if (flush) begin
+    end else if (flush || irq_take) begin
         // Anular la instruccion en IF (que se cargaria en IF/ID)
         IF_ID_IR <= 32'h3C000000;   // NOP (opcode 001111, resto 0)
         IF_ID_PC <= 10'b0;
@@ -111,9 +111,15 @@ uc UC (
 // algun fuente de la instr actualmente en ID, hay que pararlo un
 // ciclo (el dato saldra al final de MEM, en MEM/WB.MDR; entonces
 // el forwarding MEM/WB->EX puede resolverlo).
+//
+// Atencion: para una STORE en ID, el dato a almacenar viene de
+// R[wa3] (tercer puerto de lectura), por lo que tambien hay que
+// comparar con id_wa3 si la instr es STORE.
 wire load_use_hazard =
     ID_EX_MemRead && (ID_EX_wa3 != 4'b0) &&
-    ((ID_EX_wa3 == id_ra1) || (ID_EX_wa3 == id_ra2));
+    ((ID_EX_wa3 == id_ra1) ||
+     (ID_EX_wa3 == id_ra2) ||
+     (id_MemWrite && (ID_EX_wa3 == id_wa3)));
 
 // Banco de registros (lectura combinacional en ID, escritura en WB).
 // 3 puertos de lectura: rd1 (R[ra1]) y rd2 (R[ra2]) para la ALU,
@@ -345,17 +351,33 @@ wire ex_PCChange = ex_BranchTaken || ID_EX_Call || ID_EX_Ret || ID_EX_Reti;
 wire flush = ex_PCChange;
 
 // ============================================================
-// PILA (manejo de CALL / RET / RETI)
+// IRQ: deteccion + manejo
 // ============================================================
-// PUSH cuando hay CALL en EX (push PC+1 de la instruccion CALL, que
-// era IF_ID_PC en su momento, ahora esta en ID_EX_PC).
+// Estado IE (flag arquitectonico)
+wire ie_out;
+
+// IRQ se atiende cuando ie esta a 1, irq_in esta a 1 y no estamos
+// ya redirigiendo en este ciclo por otra causa.
+wire irq_take = ie_out && irq_in;
+
+// ============================================================
+// PILA (manejo de CALL / RET / RETI / IRQ)
+// ============================================================
+// PUSH cuando hay CALL en EX (push PC+1 de la instruccion CALL).
+// PUSH cuando hay IRQ pendiente (push PC actual = la que se
+// estaba a punto de fetchar). Para IRQ usamos pc (no IF_ID_PC)
+// porque queremos volver a la instruccion que aun no ha entrado
+// al pipeline.
 // POP cuando hay RET o RETI en EX.
-wire [1:0]  s_bat;
-assign s_bat = ID_EX_Call ? 2'b01 :
-               (ID_EX_Ret || ID_EX_Reti) ? 2'b10 :
-               2'b00;
+wire [1:0] s_bat;
+wire [9:0] stack_din;
+assign s_bat   = irq_take ? 2'b01 :
+                 ID_EX_Call ? 2'b01 :
+                 (ID_EX_Ret || ID_EX_Reti) ? 2'b10 :
+                 2'b00;
+assign stack_din = irq_take ? pc : ID_EX_PC;
 wire [9:0] stack_top;
-stack PILA (clk, reset, s_bat, ID_EX_PC, stack_top);
+stack PILA (clk, reset, s_bat, stack_din, stack_top);
 
 // ============================================================
 // Direccion de salto: jump_addr de instr o stack_top para RET
@@ -370,8 +392,11 @@ wire [9:0] ex_jump_target =
 //   Si stall LOAD-use: pc_next se congela en pc (asi memprog
 //   tampoco avanza la lectura y no se pierde ninguna
 //   instruccion).
+//   Si IRQ pendiente: PC <= 0x010 (vector). Mayor prioridad
+//   que todo lo anterior.
 // ============================================================
-assign pc_next = load_use_hazard ? pc :
+assign pc_next = irq_take        ? 10'h010 :
+                 load_use_hazard ? pc :
                  ex_PCChange     ? ex_jump_target :
                                    pc_inc;
 
@@ -471,14 +496,20 @@ assign wb_wa3      = MEM_WB_wa3;
 assign wb_RegWrite = MEM_WB_RegWrite;
 
 // ============================================================
-// Flag IE (placeholder - interrupciones en fase 5)
+// Flag IE
+// Fuentes de cambio (con prioridad):
+//   1. IRQ atendida (irq_take): IE <= 0 (DI automatico)
+//   2. EI/DI/RETI en EX (ID_EX_s_int != 00): IE <= s_int[0]
+// Las dos cosas pueden ocurrir el mismo ciclo (raro pero posible);
+// la IRQ gana porque el flag tiene que estar a 0 para que la ISR
+// arranque limpia.
 // ============================================================
-wire ie_load;
-assign ie_load = ID_EX_s_int[0] | ID_EX_s_int[1];
-wire ie_out;
-ffd FIE (clk, reset, ID_EX_s_int[0], ie_load, ie_out);
+wire ie_we   = irq_take || ID_EX_s_int[0] || ID_EX_s_int[1];
+wire ie_din  = irq_take ? 1'b0 : ID_EX_s_int[0];
+ffd FIE (clk, reset, ie_din, ie_we, ie_out);
 
-assign irq_ack = 1'b0;     // todavia no implementado
+// irq_ack: pulso de 1 ciclo cuando se atiende una IRQ
+assign irq_ack = irq_take;
 
 // ============================================================
 // Salidas
